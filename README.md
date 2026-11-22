@@ -17,6 +17,17 @@ the most recent batch can be restored with one command.
   `dedupe --restore` brings back the last batch.
 - **Interactive TUI** — progress bar during scan, group navigation, keeper
   strategies (shortest path / oldest / newest), per-group wasted-space totals.
+- **Mouse-first file operations** — every common action has a button: a top
+  action bar (Rescan / Sort / Select all / Delete marked / Trash / Tools /
+  Quit), a group filter box with Filter and Clear buttons, per-group keeper
+  strategy buttons, and per-file buttons: Mark, Keep this, Open (opens the
+  file with the platform default app), Reveal (shows it in the file
+  manager), Copy path, Info, Preview and Hide info.
+- **Trash browser** — press `v` or the Trash button to list every deleted
+  batch with its files, and restore any batch (or the latest one) with a
+  button; the main view rescans automatically afterwards.
+- **Text preview & file info** — preview the first lines of any duplicate
+  (binary-safe) and see its full path, size and modification time.
 - **Headless mode** — `dedupe --scan` prints a report and touches nothing; safe
   for scripts and cron.
 - **Bundled file tools** — one binary, twelve subcommands (see below).
@@ -53,7 +64,24 @@ dedupe --min-size N     ignore files smaller than N bytes
 
 Keybindings are shown in the TUI footer: `space` marks a file, `a` selects
 all in the group, `d` deletes the marked files to trash, `r` rescans,
-`s` re-sorts, `t` opens the tools screen, `q` quits.
+`s` re-sorts, `g` cycles the keeper strategy, `f` jumps to the filter box,
+`v` opens the trash browser, `o`/`c`/`i`/`p` open, copy, inspect or preview
+the selected file, `t` opens the tools screen, `q` quits. Every one of these
+actions also has a clickable button.
+
+### Skipped features (with reasons)
+
+In the spirit of Swiss File Knife the following ideas were considered and
+deliberately left out:
+
+- **Secure/irrecoverable delete** — unverifiable on modern filesystems and
+  contrary to the trash-first safety model.
+- **File split/join and base64/hexdump converters** — niche utilities with
+  questionable value inside a dedupe workflow.
+- **Two-way folder sync / mirror** — risk of destructive overwrite; the safe
+  one-way `backup` and `compare` tools already cover the common cases.
+- **Similar-image/audio detection** — requires heavy ML dependencies;
+  skipped per the "no dependency hell" rule.
 
 ## File tools
 

@@ -36,7 +36,7 @@ from rich.text import Text
 from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Center, Horizontal, Vertical, VerticalScroll
+from textual.containers import Center, Grid, Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
 from textual.widgets import (
     Button,
@@ -287,17 +287,7 @@ def trash_files(paths: list[Path]) -> None:
         save()
 
 
-def restore_last_batch() -> int:
-    if not TRASH_ROOT.exists():
-        return 0
-    manifests = sorted(
-        TRASH_ROOT.glob("*/manifest.json"),
-        key=lambda path: json.loads(path.read_text())["created"],
-    )
-    if not manifests:
-        return 0
-
-    manifest_path = manifests[-1]
+def restore_batch(manifest_path: Path) -> int:
     manifest = json.loads(manifest_path.read_text())
     restored = 0
     for entry in manifest["entries"]:
@@ -310,6 +300,32 @@ def restore_last_batch() -> int:
         restored += 1
     shutil.rmtree(manifest_path.parent)
     return restored
+
+
+def restore_last_batch() -> int:
+    if not TRASH_ROOT.exists():
+        return 0
+    manifests = sorted(
+        TRASH_ROOT.glob("*/manifest.json"),
+        key=lambda path: json.loads(path.read_text())["created"],
+    )
+    if not manifests:
+        return 0
+    return restore_batch(manifests[-1])
+
+
+def trash_batches() -> list[tuple[Path, dict]]:
+    """Return (manifest_path, manifest) pairs, oldest first."""
+    if not TRASH_ROOT.exists():
+        return []
+    batches: list[tuple[Path, dict]] = []
+    for manifest_path in TRASH_ROOT.glob("*/manifest.json"):
+        try:
+            batches.append((manifest_path, json.loads(manifest_path.read_text())))
+        except (OSError, json.JSONDecodeError, KeyError):
+            continue
+    batches.sort(key=lambda item: item[1].get("created", ""))
+    return batches
 
 
 # --------------------------------------------------------------------------- #
@@ -969,6 +985,172 @@ class ToolsScreen(Screen):
         self.app.server_process = None
         self._set_output("Server stopped.")
 
+class BatchItem(ListItem):
+    def __init__(self, manifest: Path, data: dict) -> None:
+        super().__init__()
+        self.manifest = manifest
+        self.data = data
+
+    def compose(self) -> ComposeResult:
+        created = str(self.data.get("created", "?"))
+        entries = self.data.get("entries", [])
+        lines = Text()
+        lines.append(f"{created}  ", style="cyan")
+        lines.append(f"{len(entries)} file(s)  ", style="white")
+        first = Path(entries[0]["original"]).parent if entries else ""
+        lines.append(f"from {first} ...", style="dim")
+        yield Static(lines, classes="batch-row")
+
+
+class TrashScreen(Screen):
+    TITLE = "Trash"
+    CSS = """
+    TrashScreen { background: #0d1117; }
+    TrashScreen #columns { height: 1fr; padding: 1 2; }
+    TrashScreen #list-pane, TrashScreen #detail-pane {
+        border: solid #253244;
+        background: #101822;
+        padding: 1;
+    }
+    TrashScreen #list-pane { width: 42%; }
+    TrashScreen #detail-pane { width: 1fr; }
+    TrashScreen .pane-title { color: #7dd3fc; text-style: bold; height: 1; }
+    TrashScreen ListItem { height: 1; padding: 0 1; }
+    TrashScreen .batch-row, .entry-row {
+        height: 1;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
+    }
+    TrashScreen #batch-detail { color: #94a3b8; height: 1; }
+    TrashScreen #buttons {
+        height: 3;
+        width: 100%;
+        layout: grid;
+        grid-size: 4 1;
+    }
+    TrashScreen #buttons > Button { width: 1fr; margin: 0; }
+    TrashScreen #entries-scroll {
+        border: solid #1f2d3d;
+        height: 1fr;
+        min-height: 3;
+    }
+    TrashScreen #entries { color: #c9d4e2; padding: 0 1; }
+    """
+
+    BINDINGS = [
+        Binding("escape", "back", "Back"),
+        Binding("r", "restore_selected", "Restore selected"),
+        Binding("l", "restore_latest", "Restore latest"),
+        Binding("f5", "refresh", "Refresh"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        self.restored = False
+        with Horizontal(id="columns"):
+            with Vertical(id="list-pane"):
+                yield Static("  TRASH BATCHES", classes="pane-title")
+                yield ListView(id="batches")
+            with Vertical(id="detail-pane"):
+                yield Static("  FILES IN BATCH", classes="pane-title")
+                yield Static("", id="batch-detail")
+                with VerticalScroll(id="entries-scroll"):
+                    yield Static("", id="entries")
+                with Grid(id="buttons"):
+                    yield Button("Restore", id="restore-selected", variant="success")
+                    yield Button("Latest", id="restore-latest")
+                    yield Button("Refresh", id="refresh")
+                    yield Button("Back", id="back")
+        yield Footer()
+
+    async def on_mount(self) -> None:
+        await self.reload_batches()
+
+    async def reload_batches(self) -> None:
+        self.batches = trash_batches()
+        view = self.query_one("#batches", ListView)
+        await view.clear()
+        await view.extend(
+            BatchItem(manifest, data) for manifest, data in self.batches
+        )
+        if self.batches:
+            view.index = len(self.batches) - 1
+        else:
+            self.query_one("#batch-detail", Static).update(
+                "Trash is empty. Deleted files land in ~/.dedupe_trash."
+            )
+            self.query_one("#entries", Static).update("")
+
+    def _current_batch(self) -> tuple[Path, dict] | None:
+        index = self.query_one("#batches", ListView).index
+        if index is None or not 0 <= index < len(getattr(self, "batches", [])):
+            return None
+        return self.batches[index]
+
+    @on(ListView.Highlighted, "#batches")
+    @on(ListView.Selected, "#batches")
+    def show_batch(self, event: ListView.Highlighted) -> None:
+        item = event.item if isinstance(event.item, BatchItem) else None
+        if item is None:
+            return
+        entries = item.data.get("entries", [])
+        self.query_one("#batch-detail", Static).update(
+            f"{len(entries)} file(s) · deleted {item.data.get('created', '?')}"
+        )
+        body = Text()
+        for entry in entries:
+            body.append(f"{entry['original']}\n", style="white")
+        self.query_one("#entries", Static).update(body)
+
+    def _do_restore(self, manifest: Path | None) -> None:
+        if manifest is None:
+            self.notify("No batch selected", severity="warning")
+            return
+        self.restored = True
+
+        def done(count: int) -> None:
+            self.notify(f"Restored {count} file(s)")
+            asyncio.create_task(self.reload_batches())
+
+        asyncio.create_task(self._restore_async(manifest, done))
+
+    async def _restore_async(self, manifest: Path, done) -> None:
+        count = await asyncio.to_thread(restore_batch, manifest)
+        done(count)
+
+    @on(Button.Pressed, "#restore-selected")
+    def restore_selected(self) -> None:
+        batch = self._current_batch()
+        self._do_restore(batch[0] if batch else None)
+
+    @on(Button.Pressed, "#restore-latest")
+    def restore_latest(self) -> None:
+        if not getattr(self, "batches", []):
+            self.notify("Trash is empty", severity="warning")
+            return
+        self._do_restore(self.batches[-1][0])
+
+    def action_restore_selected(self) -> None:
+        self.restore_selected()
+
+    def action_restore_latest(self) -> None:
+        self.restore_latest()
+
+    async def action_refresh(self) -> None:
+        await self.reload_batches()
+
+    @on(Button.Pressed, "#refresh")
+    def refresh_button(self) -> None:
+        asyncio.create_task(self.reload_batches())
+
+    @on(Button.Pressed, "#back")
+    def back(self) -> None:
+        self.dismiss()
+
+    def action_back(self) -> None:
+        self.dismiss()
+
+
 # --------------------------------------------------------------------------- #
 # TUI app                                                                     #
 # --------------------------------------------------------------------------- #
@@ -1006,6 +1188,43 @@ class DedupeApp(App):
         text-wrap: nowrap;
         text-overflow: ellipsis;
     }
+    #actions {
+        height: 3;
+        padding: 0 2;
+        background: #111b26;
+    }
+    #actions > Button { width: auto; min-width: 8; margin: 0 1 0 0; }
+    #keeperbar {
+        height: 3;
+        padding: 0 1;
+        layout: grid;
+        grid-size: 3 1;
+    }
+    #keeperbar > Button { width: 1fr; margin: 0 1 0 0; }
+    #keeperbar > Button.-keeper-active { border: tall #7ee787; color: #7ee787; }
+    #filebar {
+        height: 6;
+        padding: 0 1;
+        layout: grid;
+        grid-size: 4 2;
+        grid-rows: 3;
+    }
+    #filebar > Button { width: 1fr; margin: 0 1 0 0; }
+    #hint.-hidden { display: none; }
+    #filterbar {
+        height: 3;
+        padding: 0 1;
+    }
+    #filterbar > Input { width: 1fr; }
+    #filterbar > Button { width: auto; min-width: 6; margin: 0 0 0 1; }
+    #preview {
+        border: solid #1f2d3d;
+        background: #0b1219;
+        height: 12;
+        display: none;
+        padding: 0 1;
+    }
+    #preview.-visible { display: block; }
     """
 
     BINDINGS = [
@@ -1013,10 +1232,19 @@ class DedupeApp(App):
         Binding("r", "rescan", "Rescan"),
         Binding("s", "sort", "Sort"),
         Binding("t", "tools", "Tools"),
+        Binding("v", "trash", "Trash"),
+        Binding("f", "focus_filter", "Filter"),
         Binding("space", "toggle", "Mark", priority=True),
         Binding("a", "select_all", "Select all"),
+        Binding("g", "cycle_keep", "Keep strategy"),
         Binding("d", "delete", "Delete marked", priority=True),
+        Binding("o", "open_file", "Open file"),
+        Binding("c", "copy_path", "Copy path"),
+        Binding("i", "file_info", "Info"),
+        Binding("p", "preview_file", "Preview"),
     ]
+
+    KEEP_STRATEGIES = ("shortest", "oldest", "newest")
 
     def __init__(self, root: Path, keep: str, sort_key: str, min_size: int) -> None:
         super().__init__()
@@ -1025,8 +1253,10 @@ class DedupeApp(App):
         self.sort_key = sort_key
         self.min_size = min_size
         self.groups: list[Group] = []
+        self.shown: list[Group] | None = None
         self.current = -1
         self.scanned = 0
+        self.file_index: int | None = None
         self.scan_state = ScanProgress("walking")
         self.server_process: subprocess.Popen[str] | None = None
         self.server_url = ""
@@ -1037,20 +1267,229 @@ class DedupeApp(App):
         with Horizontal(id="topbar"):
             yield Static("", id="stats")
             yield ProgressBar(id="bar", show_percentage=False)
+        with Horizontal(id="actions"):
+            yield Button("Rescan", id="btn-rescan")
+            yield Button("Sort: waste", id="btn-sort")
+            yield Button("Select all", id="btn-select-all")
+            yield Button("Delete marked", id="btn-delete", variant="error")
+            yield Button("Trash", id="btn-trash")
+            yield Button("Tools", id="btn-tools")
+            yield Button("Quit", id="btn-quit")
         with Horizontal(id="body"):
             with Vertical(id="left"):
                 yield Static("  DUPLICATE GROUPS", classes="pane-title")
+                yield Horizontal(
+                    Input(placeholder="filter groups by name…", id="filter"),
+                    Button("Filter", id="btn-filter"),
+                    Button("Clear", id="btn-filter-clear"),
+                    id="filterbar",
+                )
                 yield ListView(id="groups")
             with Vertical(id="right"):
                 yield Static("  FILES IN GROUP", id="detail-title", classes="pane-title")
                 yield ListView(id="files")
+                with Horizontal(id="keeperbar"):
+                    yield Button("shortest", id="btn-keep-shortest")
+                    yield Button("oldest", id="btn-keep-oldest")
+                    yield Button("newest", id="btn-keep-newest")
+                with Horizontal(id="filebar"):
+                    yield Button("Mark", id="btn-mark")
+                    yield Button("Keep this", id="btn-keep")
+                    yield Button("Open", id="btn-open")
+                    yield Button("Reveal", id="btn-reveal")
+                    yield Button("Copy path", id="btn-copy")
+                    yield Button("Info", id="btn-info")
+                    yield Button("Preview", id="btn-preview")
+                    yield Button("Hide info", id="btn-hide-info")
+                yield Static("", id="preview")
                 yield Static("", id="hint")
         yield Footer()
 
     async def on_mount(self) -> None:
         self.query_one("#bar", ProgressBar).styles.display = "none"
+        self._update_keeper_buttons()
         await self.perform_scan()
         self.query_one("#groups", ListView).focus()
+
+    def selected_path(self) -> Path | None:
+        if self.current < 0:
+            return None
+        files = self.groups[self.current].files
+        index = self.file_index
+        if index is None or not 0 <= index < len(files):
+            return None
+        return files[index]
+
+    def _set_hint(self, text: Text | str) -> None:
+        self.query_one("#hint", Static).update(text)
+
+    def action_open_file(self) -> None:
+        path = self.selected_path()
+        if path is None:
+            self.notify("No file selected", severity="warning")
+            return
+        opener = {
+            "darwin": ["open"],
+            "linux": ["xdg-open"],
+            "windows": ["cmd", "/c", "start", ""],
+        }.get(sys.platform)
+        if opener is None:
+            self.notify(f"No opener for {sys.platform}", severity="warning")
+            return
+        try:
+            subprocess.Popen([*opener, str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.notify(f"Opened {path.name}")
+        except OSError as error:
+            self.notify(f"Open failed: {error}", severity="error")
+
+    def action_reveal(self) -> None:
+        path = self.selected_path()
+        if path is None:
+            self.notify("No file selected", severity="warning")
+            return
+        folder = str(path.parent)
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", "-R", str(path)])
+            elif os.name == "nt":
+                subprocess.Popen(["explorer", "/select,", str(path)])
+            else:
+                subprocess.Popen(["xdg-open", folder])
+            self.notify(f"Revealed {path.parent}")
+        except OSError as error:
+            self.notify(f"Reveal failed: {error}", severity="error")
+
+    def action_copy_path(self) -> None:
+        path = self.selected_path()
+        if path is None:
+            self.notify("No file selected", severity="warning")
+            return
+        try:
+            self.app.copy_to_clipboard(str(path))
+            self._set_hint(f"  copied: {path}")
+            self.notify("Full path copied to clipboard")
+        except Exception as error:  # noqa: BLE001 - clipboard is best-effort
+            self._set_hint(f"  {path}")
+            self.notify(f"Copy failed: {error}", severity="error")
+
+    def action_file_info(self) -> None:
+        path = self.selected_path()
+        if path is None:
+            self.notify("No file selected", severity="warning")
+            return
+        try:
+            info = path.stat()
+        except OSError as error:
+            self.notify(f"Info failed: {error}", severity="error")
+            return
+        text = Text()
+        text.append(f"{path}\n", style="white")
+        text.append(
+            f"{human_bytes(info.st_size)} · modified "
+            f"{datetime.fromtimestamp(info.st_mtime):%Y-%m-%d %H:%M:%S}",
+            style="dim",
+        )
+        self.query_one("#preview", Static).update(text)
+        self.query_one("#preview").add_class("-visible")
+        self.query_one("#hint").add_class("-hidden")
+
+    async def action_preview_file(self) -> None:
+        path = self.selected_path()
+        if path is None:
+            self.notify("No file selected", severity="warning")
+            return
+        body = await asyncio.to_thread(self._read_preview, path)
+        self.query_one("#preview", Static).update(body)
+        self.query_one("#preview").add_class("-visible")
+        self.query_one("#hint").add_class("-hidden")
+
+    @staticmethod
+    def _read_preview(path: Path, lines: int = 20) -> Text:
+        text = Text()
+        try:
+            with path.open("rb") as handle:
+                head = handle.read(64 * 1024)
+        except OSError as error:
+            return Text(f"cannot read {path}: {error}", style="red")
+        if b"\x00" in head:
+            text.append(f"{path}\n", style="white")
+            text.append("binary content — no text preview", style="dim")
+            return text
+        body = head.decode("utf-8", errors="replace").splitlines()
+        text.append(f"{path}\n", style="white")
+        for line in body[:lines]:
+            text.append(line[:200] + "\n", style="white")
+        if len(body) > lines:
+            text.append(f"… ({len(body) - lines} more lines)", style="dim")
+        return text
+
+    def keep_file(self, index: int) -> None:
+        if self.current < 0:
+            return
+        group = self.groups[self.current]
+        if not 0 <= index < len(group.files):
+            return
+        group.keeper = group.files[index]
+        group.marked.discard(group.keeper)
+        asyncio.create_task(self.refresh_files())
+
+    def action_cycle_keep(self) -> None:
+        current = self.KEEP_STRATEGIES.index(self.keep) if self.keep in self.KEEP_STRATEGIES else -1
+        self.set_keep_strategy(self.KEEP_STRATEGIES[(current + 1) % len(self.KEEP_STRATEGIES)])
+
+    def set_keep_strategy(self, strategy: str) -> None:
+        if strategy not in self.KEEP_STRATEGIES:
+            return
+        self.keep = strategy
+        for group in self.groups:
+            try:
+                group.keeper = choose_keeper(group.files, strategy)
+                group.marked.discard(group.keeper)
+            except OSError:
+                continue
+        self._update_keeper_buttons()
+        self.notify(f"Keeper strategy: {strategy}")
+        asyncio.create_task(self.refresh_files())
+
+    def _update_keeper_buttons(self) -> None:
+        for name in self.KEEP_STRATEGIES:
+            button = self.query_one(f"#btn-keep-{name}", Button)
+            if name == self.keep:
+                button.add_class("-keeper-active")
+            else:
+                button.remove_class("-keeper-active")
+
+    def action_focus_filter(self) -> None:
+        self.query_one("#filter", Input).focus()
+
+    def apply_filter(self, pattern: str) -> None:
+        pattern = pattern.strip().lower()
+        if not pattern:
+            return self.clear_filter()
+        visible = [
+            group
+            for group in self.groups
+            if any(pattern in str(path).lower() for path in group.files)
+        ]
+        asyncio.create_task(self._render_groups(visible))
+
+    def clear_filter(self) -> None:
+        self.query_one("#filter", Input).value = ""
+        asyncio.create_task(self._render_groups(self.groups))
+
+    async def _render_groups(self, groups: list[Group]) -> None:
+        self.shown = groups
+        view = self.query_one("#groups", ListView)
+        await view.clear()
+        await view.extend(GroupItem(group, self.root) for group in groups)
+        if groups:
+            view.index = 0
+            await self.show_group(groups[0].index, focus=False)
+        else:
+            self.current = -1
+            self.query_one("#detail-title", Static).update("  FILES IN GROUP")
+            await self.query_one("#files", ListView).clear()
+            self._set_hint("  no matching groups")
 
     # -- scanning -------------------------------------------------------- #
 
@@ -1139,6 +1578,7 @@ class DedupeApp(App):
             return
         self.current = index
         group = self.groups[index]
+        self.file_index = 0
         title = self.query_one("#detail-title", Static)
         title.update(
             Text("  GROUP ")
@@ -1152,9 +1592,10 @@ class DedupeApp(App):
             FileItem(group, path, self.root)
             for path in group.files
         )
+        self.query_one("#hint").remove_class("-hidden")
         self.query_one("#hint", Static).update(
             Text("  ").append(
-                f"{len(group.marked)} marked · space mark · d delete · restore: dedupe --restore",
+                f"{len(group.marked)} marked · space mark · d delete · buttons below: open / reveal / copy / info / preview",
                 style="dim",
             )
         )
@@ -1180,7 +1621,78 @@ class DedupeApp(App):
 
     @on(ListView.Selected, "#files")
     async def select_file(self, event: ListView.Selected) -> None:
+        self.file_index = event.index
         self.toggle_file(event.index)
+
+    @on(ListView.Highlighted, "#files")
+    def track_file(self, event: ListView.Highlighted) -> None:
+        self.file_index = event.list_view.index
+
+    @on(Input.Submitted, "#filter")
+    async def filter_submitted(self, event: Input.Submitted) -> None:
+        self.apply_filter(event.value)
+        self.query_one("#groups", ListView).focus()
+
+    @on(Button.Pressed)
+    def button_pressed(self, event: Button.Pressed) -> None:
+        button_id = event.button.id or ""
+        handlers = {
+            "btn-rescan": lambda: self.action_rescan(),
+            "btn-sort": self.action_sort,
+            "btn-select-all": self.action_select_all,
+            "btn-delete": self.action_delete,
+            "btn-trash": self.action_trash,
+            "btn-tools": self.action_tools,
+            "btn-quit": self.action_quit,
+            "btn-filter": self._filter_from_input,
+            "btn-filter-clear": self.clear_filter,
+            "btn-mark": self._mark_selected,
+            "btn-keep": self._keep_selected,
+            "btn-open": self.action_open_file,
+            "btn-reveal": self.action_reveal,
+            "btn-copy": self.action_copy_path,
+            "btn-info": self.action_file_info,
+            "btn-preview": lambda: asyncio.create_task(self.action_preview_file()),
+            "btn-hide-info": self._hide_info,
+            "btn-keep-shortest": lambda: self.set_keep_strategy("shortest"),
+            "btn-keep-oldest": lambda: self.set_keep_strategy("oldest"),
+            "btn-keep-newest": lambda: self.set_keep_strategy("newest"),
+        }
+        handler = handlers.get(button_id)
+        if handler is not None:
+            result = handler()
+            if asyncio.iscoroutine(result):
+                asyncio.create_task(result)
+
+    def _hide_info(self) -> None:
+        self.query_one("#preview").remove_class("-visible")
+        self.query_one("#hint").remove_class("-hidden")
+
+    def _filter_from_input(self) -> None:
+        self.apply_filter(self.query_one("#filter", Input).value)
+
+    def _mark_selected(self) -> None:
+        index = self.file_index
+        if index is None:
+            self.notify("No file selected", severity="warning")
+            return
+        self.toggle_file(index)
+
+    def _keep_selected(self) -> None:
+        index = self.file_index
+        if index is None:
+            self.notify("No file selected", severity="warning")
+            return
+        self.keep_file(index)
+
+    def action_trash(self) -> None:
+        def closed(_screen=None) -> None:
+            screen = getattr(self, "_trash_screen", None)
+            if screen is not None and getattr(screen, "restored", False):
+                asyncio.create_task(self.perform_scan())
+
+        self._trash_screen = TrashScreen()
+        self.push_screen(self._trash_screen, closed)
 
     # -- actions --------------------------------------------------------- #
 
@@ -1232,6 +1744,7 @@ class DedupeApp(App):
         for index, group in enumerate(self.groups):
             group.index = index
         self.notify(f"Sorted by {'name' if key == 'name' else 'wasted space'}")
+        self.query_one("#btn-sort", Button).label = f"Sort: {key}"
         asyncio.create_task(self.rebuild_groups())
 
     def action_delete(self) -> None:
