@@ -1,0 +1,4 @@
+rich>=13
+textual>=0.40
+qrcode>=7
+pillow>=10
