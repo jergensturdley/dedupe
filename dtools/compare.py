@@ -8,7 +8,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-from .common import hash_file, human_bytes, is_excluded, iter_files
+from .common import hash_file, human_bytes, is_excluded, iter_file_stats, iter_files
 
 
 def _manifest(root: Path, excludes: list[str]) -> dict[str, tuple[int, str]]:
@@ -95,13 +95,20 @@ def cmd_treesize(args) -> int:
         return 1
     total = 0
     per_folder: dict[str, int] = defaultdict(int)
-    for path in iter_files(root):
-        size = path.stat().st_size
+    root_prefix = os.fspath(root)
+    if not root_prefix.endswith(os.sep):
+        root_prefix += os.sep
+    prefix_len = len(root_prefix)
+    sep = os.sep
+    for path_str, info in iter_file_stats(root):
+        size = info.st_size
         total += size
-        rel = path.relative_to(root)
-        for parent in rel.parents:
-            if parent != Path("."):
-                per_folder[parent.as_posix()] += size
+        rel = path_str[prefix_len:] if path_str.startswith(root_prefix) else path_str
+        idx = rel.rfind(sep)
+        while idx > 0:
+            folder = rel[:idx] if sep == "/" else rel[:idx].replace(sep, "/")
+            per_folder[folder] += size
+            idx = rel.rfind(sep, 0, idx)
     print(f"{human_bytes(total)}  {root}")
     for folder, size in sorted(per_folder.items(), key=lambda item: (-item[1], item[0]))[:40]:
         print(f"{human_bytes(size):>8}  {folder}")
