@@ -5,6 +5,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import os
+import stat
 from pathlib import Path
 from typing import Iterator, Sequence
 
@@ -22,21 +23,66 @@ def human_bytes(size: int) -> str:
     raise AssertionError("unreachable")
 
 
+def iter_file_stats(root: Path) -> Iterator[tuple[str, os.stat_result]]:
+    """Yield (path_str, stat_result) for regular files below root without following symlinks."""
+    root_str = os.fspath(root)
+    try:
+        info = os.lstat(root_str)
+    except OSError:
+        return
+    if stat.S_ISREG(info.st_mode):
+        yield root_str, info
+        return
+    if not stat.S_ISDIR(info.st_mode):
+        return
+    stack = [root_str]
+    while stack:
+        dirpath = stack.pop()
+        try:
+            with os.scandir(dirpath) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            yield entry.path, entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+
+
 def iter_files(root: Path) -> Iterator[Path]:
     """Yield regular files below root without following any symlinks."""
-    if root.is_file():
+    root_str = os.fspath(root)
+    try:
+        info = os.lstat(root_str)
+    except OSError:
+        return
+    if stat.S_ISREG(info.st_mode):
         yield root
         return
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        dirnames[:] = [
-            name
-            for name in dirnames
-            if not os.path.islink(os.path.join(dirpath, name))
-        ]
-        for name in filenames:
-            path = Path(dirpath) / name
-            if not path.is_symlink():
-                yield path
+    if not stat.S_ISDIR(info.st_mode):
+        return
+    stack = [root_str]
+    while stack:
+        dirpath = stack.pop()
+        try:
+            with os.scandir(dirpath) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            yield Path(entry.path)
+                    except OSError:
+                        continue
+        except OSError:
+            continue
 
 
 def is_excluded(relative: str, patterns: Sequence[str]) -> bool:

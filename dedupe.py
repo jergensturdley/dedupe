@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 import hashlib
 import json
 import shlex
@@ -23,14 +23,15 @@ import subprocess
 import os
 import secrets
 import shutil
-import stat
 import sys
+import threading
+import time
 from urllib.parse import quote
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
-from dtools.common import human_bytes, iter_files
+from typing import Callable, Iterable, Iterator, TypeVar
+from dtools.common import human_bytes, iter_file_stats
 
 from rich.text import Text
 from textual import on
@@ -45,14 +46,20 @@ from textual.widgets import (
     Input,
     ListItem,
     ListView,
+    OptionList,
     ProgressBar,
     Static,
 )
 
 TRASH_ROOT = Path.home() / ".dedupe_trash"
-HASH_CHUNK = 4 * 1024 * 1024
+HASH_CHUNK = 1024 * 1024
 SAMPLE_BYTES = 64 * 1024
 HASH_WORKERS = min(8, os.cpu_count() or 4)
+SAMPLE_WORKERS = min(4, HASH_WORKERS)
+PROGRESS_INTERVAL = 0.05
+_THREAD_LOCAL = threading.local()
+_T = TypeVar("_T")
+_R = TypeVar("_R")
 
 
 # --------------------------------------------------------------------------- #
@@ -69,6 +76,7 @@ class Group:
     size: int
     keeper: Path
     marked: set[Path] = field(default_factory=set)
+    mtimes: dict[Path, float] = field(default_factory=dict)
 
     @property
     def wasted(self) -> int:
@@ -104,37 +112,214 @@ class ScanProgress:
         }.get(self.phase, self.phase)
 
 
-def digest_file(path: Path) -> tuple[bytes, int] | None:
+def _read_buffer() -> bytearray:
+    buf = getattr(_THREAD_LOCAL, "buf", None)
+    if buf is None:
+        buf = bytearray(HASH_CHUNK)
+        _THREAD_LOCAL.buf = buf
+    return buf
+
+
+def _pread_exact(fd: int, length: int, offset: int) -> bytes:
+    chunk = os.pread(fd, length, offset)
+    if len(chunk) == length or not chunk:
+        return chunk
+    parts = [chunk]
+    remaining = length - len(chunk)
+    pos = offset + len(chunk)
+    while remaining > 0:
+        piece = os.pread(fd, remaining, pos)
+        if not piece:
+            break
+        parts.append(piece)
+        remaining -= len(piece)
+        pos += len(piece)
+    return b"".join(parts)
+
+
+def digest_file(
+    path: Path | str, cancel: threading.Event | None = None
+) -> tuple[bytes, int] | None:
     digest = hashlib.blake2b(digest_size=16)
     read = 0
+    buf = _read_buffer()
+    mv = memoryview(buf)
     try:
-        with path.open("rb", buffering=0) as handle:
-            while chunk := handle.read(HASH_CHUNK):
-                digest.update(chunk)
-                read += len(chunk)
+        with open(path, "rb", buffering=0) as handle:
+            while True:
+                if cancel is not None and cancel.is_set():
+                    return None
+                n = handle.readinto(mv)
+                if not n:
+                    break
+                digest.update(mv[:n])
+                read += n
     except OSError:
         return None
     return digest.digest(), read
 
 
-def quick_key(path: Path, size: int) -> bytes | None:
+def quick_key(path: Path | str, size: int) -> bytes | None:
     digest = hashlib.blake2b(digest_size=16)
     digest.update(size.to_bytes(8, "big"))
     try:
-        with path.open("rb", buffering=0) as handle:
-            digest.update(handle.read(SAMPLE_BYTES))
-            if size > SAMPLE_BYTES * 2:
-                handle.seek(size - SAMPLE_BYTES)
+        if hasattr(os, "pread"):
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                digest.update(_pread_exact(fd, SAMPLE_BYTES, 0))
+                if size > SAMPLE_BYTES * 2:
+                    digest.update(_pread_exact(fd, SAMPLE_BYTES, size - SAMPLE_BYTES))
+            finally:
+                os.close(fd)
+        else:
+            with open(path, "rb", buffering=0) as handle:
                 digest.update(handle.read(SAMPLE_BYTES))
+                if size > SAMPLE_BYTES * 2:
+                    handle.seek(size - SAMPLE_BYTES)
+                    digest.update(handle.read(SAMPLE_BYTES))
     except OSError:
         return None
     return digest.digest()
 
-def choose_keeper(files: list[Path], strategy: str) -> Path:
+
+def _sample_or_hash(
+    item: tuple[int, str], cancel: threading.Event | None = None
+) -> tuple[bool, int, str, bytes, int] | None:
+    if cancel is not None and cancel.is_set():
+        return None
+    size, path = item
+    digest = hashlib.blake2b(digest_size=16)
+    try:
+        if size <= SAMPLE_BYTES * 2:
+            with open(path, "rb", buffering=0) as handle:
+                data = handle.read()
+            digest.update(data)
+            actual = len(data)
+            return True, actual, path, digest.digest(), actual
+        digest.update(size.to_bytes(8, "big"))
+        if hasattr(os, "pread"):
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                head = _pread_exact(fd, SAMPLE_BYTES, 0)
+                tail = _pread_exact(fd, SAMPLE_BYTES, size - SAMPLE_BYTES)
+            finally:
+                os.close(fd)
+        else:
+            with open(path, "rb", buffering=0) as handle:
+                head = handle.read(SAMPLE_BYTES)
+                handle.seek(size - SAMPLE_BYTES)
+                tail = handle.read(SAMPLE_BYTES)
+        digest.update(head)
+        digest.update(tail)
+        return False, size, path, digest.digest(), len(head) + len(tail)
+    except OSError:
+        return None
+
+
+def _chunk_by_bytes(
+    items: Iterable[tuple[int, str]],
+    max_items: int = 64,
+    max_bytes: int = 2 * 1024 * 1024,
+    per_item_cap: int | None = None,
+) -> Iterator[list[tuple[int, str]]]:
+    batch: list[tuple[int, str]] = []
+    batch_bytes = 0
+    for item in items:
+        size = item[0]
+        cost = min(size, per_item_cap) if per_item_cap is not None else size
+        if batch and (len(batch) >= max_items or batch_bytes + cost > max_bytes):
+            yield batch
+            batch = []
+            batch_bytes = 0
+        batch.append(item)
+        batch_bytes += cost
+    if batch:
+        yield batch
+
+
+def _sample_batch(
+    batch: list[tuple[int, str]], cancel: threading.Event | None = None
+) -> tuple[int, list[tuple[bool, int, str, bytes, int]]]:
+    outcomes: list[tuple[bool, int, str, bytes, int]] = []
+    processed = 0
+    for item in batch:
+        if cancel is not None and cancel.is_set():
+            break
+        processed += 1
+        outcome = _sample_or_hash(item, cancel)
+        if outcome is not None:
+            outcomes.append(outcome)
+    return processed, outcomes
+
+
+def _hash_batch(
+    batch: list[tuple[int, str]], cancel: threading.Event | None = None
+) -> list[tuple[int, str, bytes, int]]:
+    outcomes: list[tuple[int, str, bytes, int]] = []
+    for size, path_str in batch:
+        if cancel is not None and cancel.is_set():
+            break
+        result = digest_file(path_str, cancel)
+        if result is not None:
+            digest, read = result
+            outcomes.append((size, path_str, digest, read))
+    return outcomes
+
+
+def _run_bounded(
+    pool: ThreadPoolExecutor,
+    fn: Callable[[_T], _R],
+    items: Iterable[_T],
+    cancel: threading.Event | None = None,
+    max_in_flight: int = HASH_WORKERS * 4,
+) -> Iterator[_R]:
+    iterator = iter(items)
+    pending: set[Future[_R]] = set()
+
+    def fill() -> None:
+        while len(pending) < max_in_flight:
+            if cancel is not None and cancel.is_set():
+                return
+            try:
+                item = next(iterator)
+            except StopIteration:
+                return
+            pending.add(pool.submit(fn, item))
+
+    fill()
+    while pending:
+        if cancel is not None and cancel.is_set():
+            for fut in pending:
+                fut.cancel()
+            return
+        done, pending = wait(pending, return_when=FIRST_COMPLETED)
+        for fut in done:
+            if cancel is not None and cancel.is_set():
+                for rem in pending:
+                    rem.cancel()
+                return
+            try:
+                result = fut.result()
+            except OSError:
+                continue
+            yield result
+        fill()
+
+
+def choose_keeper(
+    files: list[Path],
+    strategy: str,
+    mtimes: dict[Path, float] | None = None,
+) -> Path:
+    def mtime_of(path: Path) -> float:
+        if mtimes is not None and path in mtimes:
+            return mtimes[path]
+        return path.stat().st_mtime
+
     if strategy == "oldest":
-        return min(files, key=lambda p: (p.stat().st_mtime, len(p.parts), str(p)))
+        return min(files, key=lambda p: (mtime_of(p), len(p.parts), str(p)))
     if strategy == "newest":
-        return max(files, key=lambda p: (p.stat().st_mtime, -len(p.parts), str(p)))
+        return max(files, key=lambda p: (mtime_of(p), -len(p.parts), str(p)))
     return min(files, key=lambda p: (len(p.parts), len(str(p)), str(p)))
 
 
@@ -143,108 +328,168 @@ def scan(
     keep: str = "shortest",
     progress: Callable[[ScanProgress], None] | None = None,
     min_size: int = 0,
+    cancel: threading.Event | None = None,
 ) -> ScanResult:
     root = root.expanduser().resolve()
     last_progress: ScanProgress | None = None
+    last_report_at = 0.0
 
-    def report(state: ScanProgress) -> None:
-        nonlocal last_progress
-        if progress is not None and state != last_progress:
+    def report(state: ScanProgress, force: bool = False) -> None:
+        nonlocal last_progress, last_report_at
+        if progress is None or state == last_progress:
+            return
+        now = time.monotonic()
+        if force or now - last_report_at >= PROGRESS_INTERVAL:
             progress(state)
             last_progress = state
-    by_size: dict[int, list[Path]] = {}
-    scanned = 0
-    last_report = 0
+            last_report_at = now
 
-    for path in iter_files(root):
-        try:
-            info = path.stat()
-        except OSError:
-            continue
-        if not stat.S_ISREG(info.st_mode) or info.st_size < min_size:
+    first_path: dict[int, str] = {}
+    first_mtime: dict[int, float] = {}
+    dups_by_size: dict[int, list[str]] = {}
+    dup_mtimes: dict[str, float] = {}
+    scanned = 0
+
+    for path_str, info in iter_file_stats(root):
+        size = info.st_size
+        if size < min_size:
             continue
         scanned += 1
-        if info.st_size == 0:
-            continue
-        by_size.setdefault(info.st_size, []).append(path)
-        if scanned - last_report >= 100:
-            last_report = scanned
+        if size > 0:
+            prev = first_path.get(size)
+            if prev is None:
+                first_path[size] = path_str
+                first_mtime[size] = info.st_mtime
+            else:
+                bucket = dups_by_size.get(size)
+                if bucket is None:
+                    dups_by_size[size] = [prev, path_str]
+                    dup_mtimes[prev] = first_mtime[size]
+                else:
+                    bucket.append(path_str)
+                dup_mtimes[path_str] = info.st_mtime
+        if (scanned & 511) == 0:
+            if cancel is not None and cancel.is_set():
+                return ScanResult(root=root, scanned=scanned, groups=[])
             report(ScanProgress("walking", files=scanned))
-    report(ScanProgress("walking", files=scanned))
+    first_path.clear()
+    first_mtime.clear()
+    if cancel is not None and cancel.is_set():
+        return ScanResult(root=root, scanned=scanned, groups=[])
+    report(ScanProgress("walking", files=scanned), force=True)
 
-    candidates: list[tuple[int, Path]] = []
-    sampling_total = sum(len(paths) for paths in by_size.values() if len(paths) > 1)
+    sampling_total = sum(len(paths) for paths in dups_by_size.values())
     sampling_done = 0
     sampled_bytes = 0
-    last_report = 0
-    for size, paths in by_size.items():
-        if len(paths) < 2:
-            continue
-        quick: dict[bytes, list[Path]] = {}
-        for path in paths:
-            key = quick_key(path, size)
-            if key is not None:
-                quick.setdefault(key, []).append(path)
-                sampled_bytes += min(size, SAMPLE_BYTES * 2)
-        for bucket in quick.values():
-            if len(bucket) > 1:
-                candidates.extend((size, path) for path in bucket)
-        sampling_done += len(paths)
-        if sampling_done - last_report >= 100:
-            last_report = sampling_done
-            report(
-                ScanProgress(
-                    "sampling", sampling_done, sampling_total, sampled_bytes
-                )
-            )
-    report(ScanProgress("sampling", sampling_done, sampling_total, sampled_bytes))
+    quick: dict[tuple[int, bytes], list[str]] = {}
+    full: dict[tuple[int, bytes], list[str]] = {}
 
-    full: dict[tuple[int, bytes], list[Path]] = {}
-    hash_total = len(candidates)
-    completed = 0
-    hashed_bytes = 0
-    last_count = 0
-    last_bytes = 0
-    count_step = max(1, hash_total // 100)
-    byte_step = 32 * 1024 * 1024
-    with ThreadPoolExecutor(max_workers=HASH_WORKERS) as pool:
-        futures = {
-            pool.submit(digest_file, path): (size, path)
-            for size, path in candidates
-        }
-        for future in as_completed(futures):
-            size, path = futures[future]
-            try:
-                result = future.result()
-            except OSError:
-                continue
-            if result is None:
-                continue
-            digest, read = result
-            full.setdefault((size, digest), []).append(path)
-            completed += 1
-            hashed_bytes += read
-            if completed - last_count >= count_step or hashed_bytes - last_bytes >= byte_step:
-                last_count = completed
-                last_bytes = hashed_bytes
+    if sampling_total > 0:
+        est_sample_bytes = sum(
+            min(size, SAMPLE_BYTES * 2) * len(paths)
+            for size, paths in dups_by_size.items()
+        )
+        sample_workers = (
+            min(2, SAMPLE_WORKERS)
+            if est_sample_bytes < sampling_total * 16 * 1024
+            else SAMPLE_WORKERS
+        )
+        sample_batches = _chunk_by_bytes(
+            (
+                (size, path_str)
+                for size, paths in dups_by_size.items()
+                for path_str in paths
+            ),
+            per_item_cap=SAMPLE_BYTES * 2,
+        )
+        with ThreadPoolExecutor(max_workers=sample_workers) as sample_pool:
+            for processed, outcomes in _run_bounded(
+                sample_pool,
+                lambda b: _sample_batch(b, cancel),
+                sample_batches,
+                cancel,
+                max_in_flight=sample_workers * 4,
+            ):
+                sampling_done += processed
+                for is_full, actual_size, path_str, key, nbytes in outcomes:
+                    sampled_bytes += nbytes
+                    if is_full:
+                        if actual_size >= min_size and actual_size > 0:
+                            full.setdefault((actual_size, key), []).append(path_str)
+                    else:
+                        quick.setdefault((actual_size, key), []).append(path_str)
                 report(
-                    ScanProgress("hashing", completed, hash_total, hashed_bytes)
+                    ScanProgress(
+                        "sampling", sampling_done, sampling_total, sampled_bytes
+                    )
                 )
-    report(ScanProgress("hashing", completed, hash_total, hashed_bytes))
+        if cancel is not None and cancel.is_set():
+            return ScanResult(root=root, scanned=scanned, groups=[])
+        report(
+            ScanProgress("sampling", sampling_done, sampling_total, sampled_bytes),
+            force=True,
+        )
+
+        candidates = [
+            (size, path_str)
+            for (size, _key), bucket in quick.items()
+            if len(bucket) > 1
+            for path_str in bucket
+        ]
+        quick.clear()
+        hash_total = len(candidates)
+        completed = 0
+        hashed_bytes = 0
+        if hash_total > 0:
+            hash_batches = _chunk_by_bytes(candidates)
+            with ThreadPoolExecutor(max_workers=HASH_WORKERS) as hash_pool:
+                for outcomes in _run_bounded(
+                    hash_pool,
+                    lambda b: _hash_batch(b, cancel),
+                    hash_batches,
+                    cancel,
+                ):
+                    for size, path_str, digest, read in outcomes:
+                        full.setdefault((size, digest), []).append(path_str)
+                        completed += 1
+                        hashed_bytes += read
+                    report(
+                        ScanProgress("hashing", completed, hash_total, hashed_bytes)
+                    )
+            if cancel is not None and cancel.is_set():
+                return ScanResult(root=root, scanned=scanned, groups=[])
+        report(
+            ScanProgress("hashing", completed, hash_total, hashed_bytes),
+            force=True,
+        )
+    else:
+        report(ScanProgress("sampling", 0, 0, 0), force=True)
+        report(ScanProgress("hashing", 0, 0, 0), force=True)
+        hashed_bytes = 0
 
     groups: list[Group] = []
     for (size, _digest), bucket in full.items():
         if len(bucket) < 2:
             continue
+        files = [Path(p) for p in sorted(bucket)]
+        group_mtimes = {
+            path: dup_mtimes[path_str]
+            for path, path_str in zip(files, sorted(bucket))
+            if path_str in dup_mtimes
+        }
         groups.append(
             Group(
                 index=len(groups),
-                files=sorted(bucket, key=str),
+                files=files,
                 size=size,
-                keeper=choose_keeper(bucket, keep),
+                keeper=choose_keeper(files, keep, mtimes=group_mtimes),
+                mtimes=group_mtimes,
             )
         )
-    report(ScanProgress("grouping", len(groups), len(groups), hashed_bytes))
+    report(
+        ScanProgress("grouping", len(groups), len(groups), hashed_bytes),
+        force=True,
+    )
 
     groups.sort(key=lambda g: (-g.wasted, str(g.files[0])))
     for index, group in enumerate(groups):
@@ -272,19 +517,24 @@ def trash_files(paths: list[Path]) -> None:
             json.dumps({"created": created, "entries": entries}, indent=2)
         )
 
-    for path in sorted(paths, key=str):
-        original = path.resolve()
-        name = original.name
-        destination = batch / name
-        counter = 1
-        while name in used or destination.exists():
-            name = f"{original.stem}-{counter}{original.suffix}"
+    try:
+        for index, path in enumerate(sorted(paths, key=str), start=1):
+            original = path.resolve()
+            name = original.name
             destination = batch / name
-            counter += 1
-        used.add(name)
-        shutil.move(str(original), str(destination))
-        entries.append({"original": str(original), "stored": name})
-        save()
+            counter = 1
+            while name in used or destination.exists():
+                name = f"{original.stem}-{counter}{original.suffix}"
+                destination = batch / name
+                counter += 1
+            used.add(name)
+            shutil.move(str(original), str(destination))
+            entries.append({"original": str(original), "stored": name})
+            if index % 250 == 0:
+                save()
+    finally:
+        if entries:
+            save()
 
 
 def restore_batch(manifest_path: Path) -> int:
@@ -340,6 +590,40 @@ def short_path(path: Path, root: Path) -> str:
         return str(path)
 
 
+def _group_row(group: Group, root: Path) -> Text:
+    row = Text()
+    row.append(f"{group.index + 1:02}  ", style="dim")
+    row.append(f"{human_bytes(group.wasted):>9}", style="bold red")
+    row.append(f"  {len(group.files)}x ", style="cyan")
+    row.append(short_path(group.files[0], root), style="white")
+    return row
+
+
+def _file_row(group: Group, path: Path, root: Path) -> Text:
+    marked = path in group.marked
+    row = Text()
+    row.append("[x] " if marked else "[ ] ", style="green" if marked else "dim")
+    row.append("keep " if path == group.keeper else "drop ", style="dim")
+    row.append(short_path(path, root), style="white")
+    return row
+
+
+def _scan_dir_entries(root: Path) -> list[tuple[Path, bool, int]]:
+    items: list[tuple[str, str, bool, int]] = []
+    with os.scandir(root) as it:
+        for entry in it:
+            try:
+                if entry.is_symlink():
+                    continue
+                is_dir = entry.is_dir(follow_symlinks=False)
+                size = 0 if is_dir else entry.stat(follow_symlinks=False).st_size
+                items.append((entry.name, entry.path, is_dir, size))
+            except OSError:
+                continue
+    items.sort(key=lambda item: (item[2], item[0].lower()))
+    return [(Path(path), is_dir, size) for _name, path, is_dir, size in items]
+
+
 class GroupItem(ListItem):
     def __init__(self, group: Group, root: Path) -> None:
         super().__init__()
@@ -347,12 +631,7 @@ class GroupItem(ListItem):
         self.root = root
 
     def compose(self) -> ComposeResult:
-        row = Text()
-        row.append(f"{self.group.index + 1:02}  ", style="dim")
-        row.append(f"{human_bytes(self.group.wasted):>9}", style="bold red")
-        row.append(f"  {len(self.group.files)}x ", style="cyan")
-        row.append(short_path(self.group.files[0], self.root), style="white")
-        yield Static(row, classes="group-row")
+        yield Static(_group_row(self.group, self.root), classes="group-row")
 
 
 class FileItem(ListItem):
@@ -363,12 +642,7 @@ class FileItem(ListItem):
         self.root = root
 
     def compose(self) -> ComposeResult:
-        marked = self.path in self.group.marked
-        row = Text()
-        row.append("[x] " if marked else "[ ] ", style="green" if marked else "dim")
-        row.append("keep " if self.path == self.group.keeper else "drop ", style="dim")
-        row.append(short_path(self.path, self.root), style="white")
-        yield Static(row, classes="file-row")
+        yield Static(_file_row(self.group, self.path, self.root), classes="file-row")
 
 
 class ConfirmScreen(ModalScreen[bool]):
@@ -474,8 +748,22 @@ class ServerScreen(Screen):
         text-wrap: nowrap;
         text-overflow: ellipsis;
     }
-    ServerScreen ListItem { height: 1; padding: 0 1; }
-    ServerScreen .entry-name { height: 1; text-wrap: nowrap; }
+    ServerScreen OptionList {
+        height: 1fr;
+        border: none;
+        padding: 0;
+        background: #101822;
+        color: #c9d4e2;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
+    }
+    ServerScreen OptionList:focus {
+        border: none;
+        background-tint: transparent;
+    }
+    ServerScreen OptionList > .option-list--option { padding: 0 1; }
+    ServerScreen OptionList > .option-list--option-highlighted { background: #172a38; }
+    ServerScreen OptionList:focus > .option-list--option-highlighted { background: #1e3a4a; }
     ServerScreen #selection { color: #c9d4e2; height: 2; text-wrap: wrap; }
     ServerScreen #url { color: #7dd3fc; height: 2; text-wrap: wrap; }
     ServerScreen #auth {
@@ -495,7 +783,7 @@ class ServerScreen(Screen):
     """
     BINDINGS = [
         Binding("escape", "back", "Back"),
-        Binding("enter", "activate", "Open/Select", priority=True),
+        Binding("enter", "activate", "Open/Select"),
         Binding("s", "share", "Share", priority=True),
         Binding("g", "generate_password", "Gen password", priority=True),
         Binding("x", "stop", "Stop", priority=True),
@@ -508,6 +796,8 @@ class ServerScreen(Screen):
         self.initial = initial
         self.root = Path.cwd().resolve()
         self.entries: list[Path] = []
+        self._entry_is_dir: list[bool] = []
+        self._load_gen = 0
         self.selected: Path | None = None
         self.server_url = ""
 
@@ -517,7 +807,7 @@ class ServerScreen(Screen):
             with Vertical(id="browser"):
                 yield Static("  FILES IN PWD", classes="pane-title")
                 yield Static("", id="cwd")
-                yield ListView(id="entries")
+                yield OptionList(id="entries")
             with Vertical(id="side"):
                 yield Static("  SHARE", classes="pane-title")
                 yield Static("", id="selection")
@@ -541,7 +831,7 @@ class ServerScreen(Screen):
     async def on_mount(self) -> None:
         self.query_one("#args", Input).value = self.initial
         await self.reload_entries()
-        self.query_one("#entries", ListView).focus()
+        self.query_one("#entries", OptionList).focus()
         proc = getattr(self.app, "server_process", None)
         if proc is not None and proc.poll() is None:
             url = getattr(self.app, "server_url", "")
@@ -549,73 +839,92 @@ class ServerScreen(Screen):
             self._set_auth(getattr(self.app, "server_password", None), "running")
             self._set_status("Server is running; press x to stop.")
         else:
-            self._set_selection(None)
+            self._set_selection(None, is_dir=True)
             self._set_auth(None)
             self._set_status("Click a file or use arrows + Enter.")
 
     async def reload_entries(self) -> None:
-        view = self.query_one("#entries", ListView)
-        await view.clear()
-        self.entries = []
-        if self.root.parent != self.root:
-            self.entries.append(self.root.parent)
+        self._load_gen += 1
+        gen = self._load_gen
+        target_root = self.root
+        view = self.query_one("#entries", OptionList)
+        self.query_one("#cwd", Static).update(str(target_root))
         try:
-            children = sorted(
-                self.root.iterdir(), key=lambda path: (path.is_dir(), path.name.lower())
-            )
+            scanned = await asyncio.to_thread(_scan_dir_entries, target_root)
         except OSError as error:
-            self._set_status(f"Cannot read {self.root}: {error}")
+            if gen == self._load_gen:
+                view.clear_options()
+                self.entries = []
+                self._entry_is_dir = []
+                self._set_status(f"Cannot read {target_root}: {error}")
             return
-        self.entries.extend(path for path in children if not path.is_symlink())
+        if gen != self._load_gen:
+            return
 
-        rows: list[ListItem] = []
-        for path in self.entries:
-            if path == self.root.parent:
-                row = Text("..", style="bold cyan")
-            elif path.is_dir():
-                row = Text("dir", style="bold cyan").append(f"  {path.name}")
+        entries: list[Path] = []
+        is_dirs: list[bool] = []
+        rows: list[Text] = []
+        if target_root.parent != target_root:
+            entries.append(target_root.parent)
+            is_dirs.append(True)
+            rows.append(Text("..", style="bold cyan"))
+        for path, is_dir, size in scanned:
+            entries.append(path)
+            is_dirs.append(is_dir)
+            if is_dir:
+                rows.append(Text("dir", style="bold cyan").append(f"  {path.name}"))
             else:
-                try:
-                    size = path.stat().st_size
-                except OSError:
-                    size = 0
-                row = Text("file", style="dim").append(
-                    f" {human_bytes(size):>8}  {path.name}"
+                rows.append(
+                    Text("file", style="dim").append(
+                        f" {human_bytes(size):>8}  {path.name}"
+                    )
                 )
-            rows.append(ListItem(Static(row, classes="entry-name")))
-        await view.extend(rows)
-        self.query_one("#cwd", Static).update(str(self.root))
+
+        self.entries = entries
+        self._entry_is_dir = is_dirs
+        view.clear_options()
+        view.add_options(rows)
         if self.entries:
-            view.index = 0
+            view.highlighted = 0
 
-    @on(ListView.Highlighted, "#entries")
-    def preview_entry(self, event: ListView.Highlighted) -> None:
-        index = event.list_view.index
-        if index is not None and 0 <= index < len(self.entries):
-            self._set_selection(self.entries[index])
+    @on(OptionList.OptionHighlighted, "#entries")
+    def preview_entry(self, event: OptionList.OptionHighlighted) -> None:
+        index = event.option_index
+        if 0 <= index < len(self.entries):
+            self._set_selection(self.entries[index], is_dir=self._entry_is_dir[index])
 
-    @on(ListView.Selected, "#entries")
-    async def activate_entry(self, event: ListView.Selected) -> None:
-        index = event.index
-        if index is None or not 0 <= index < len(self.entries):
+    @on(OptionList.OptionSelected, "#entries")
+    async def activate_entry(self, event: OptionList.OptionSelected) -> None:
+        await self._activate_index(event.option_index)
+
+    async def action_activate(self) -> None:
+        view = self.query_one("#entries", OptionList)
+        if view.highlighted is not None:
+            await self._activate_index(view.highlighted)
+
+    async def _activate_index(self, index: int) -> None:
+        if not 0 <= index < len(self.entries):
             return
         path = self.entries[index]
+        is_dir = self._entry_is_dir[index]
         if path == self.root.parent:
             self.root = path
             await self.reload_entries()
             self._set_status(f"Opened {path}; press u to go up.")
-        elif path.is_dir():
+        elif is_dir:
             self.root = path
             await self.reload_entries()
             self._set_status(f"Opened {path.name}; click a file to select it.")
         else:
             self.selected = path
-            self._set_selection(path)
+            self._set_selection(path, is_dir=False)
             self._set_status(f"Selected {path.name}; press s or click Share. Flags are optional.")
 
-    def _set_selection(self, path: Path | None) -> None:
+    def _set_selection(self, path: Path | None, is_dir: bool | None = None) -> None:
         target = path or self.root
-        kind = "folder" if target.is_dir() else "file"
+        if is_dir is None:
+            is_dir = target.is_dir()
+        kind = "folder" if is_dir else "file"
         self.query_one("#selection", Static).update(
             f"{kind}: {target}\nPress s or click Share to serve this {kind}."
         )
@@ -1179,15 +1488,23 @@ class DedupeApp(App):
     #left { width: 42%; }
     #right { width: 1fr; }
     .pane-title { color: #7dd3fc; text-style: bold; height: 1; }
-    ListView { background: #101822; color: #c9d4e2; }
-    ListItem { padding: 0 1; }
-    ListItem:focus > Static { background: #1e3a4a; }
-    #hint { color: #68798b; height: 1; text-wrap: nowrap; text-overflow: ellipsis; }
-    .group-row, .file-row {
-        height: 1;
+    OptionList {
+        height: 1fr;
+        border: none;
+        padding: 0;
+        background: #101822;
+        color: #c9d4e2;
         text-wrap: nowrap;
         text-overflow: ellipsis;
     }
+    OptionList:focus {
+        border: none;
+        background-tint: transparent;
+    }
+    OptionList > .option-list--option { padding: 0 1; }
+    OptionList > .option-list--option-highlighted { background: #172a38; }
+    OptionList:focus > .option-list--option-highlighted { background: #1e3a4a; }
+    #hint { color: #68798b; height: 1; text-wrap: nowrap; text-overflow: ellipsis; }
     #actions {
         height: 3;
         padding: 0 2;
@@ -1258,6 +1575,8 @@ class DedupeApp(App):
         self.scanned = 0
         self.file_index: int | None = None
         self.scan_state = ScanProgress("walking")
+        self._scan_task: asyncio.Task[None] | None = None
+        self._scan_cancel: threading.Event | None = None
         self.server_process: subprocess.Popen[str] | None = None
         self.server_url = ""
         self.server_password: str | None = None
@@ -1269,7 +1588,7 @@ class DedupeApp(App):
             yield ProgressBar(id="bar", show_percentage=False)
         with Horizontal(id="actions"):
             yield Button("Rescan", id="btn-rescan")
-            yield Button("Sort: waste", id="btn-sort")
+            yield Button(f"Sort: {self.sort_key}", id="btn-sort")
             yield Button("Select all", id="btn-select-all")
             yield Button("Delete marked", id="btn-delete", variant="error")
             yield Button("Trash", id="btn-trash")
@@ -1284,10 +1603,10 @@ class DedupeApp(App):
                     Button("Clear", id="btn-filter-clear"),
                     id="filterbar",
                 )
-                yield ListView(id="groups")
+                yield OptionList(id="groups")
             with Vertical(id="right"):
                 yield Static("  FILES IN GROUP", id="detail-title", classes="pane-title")
-                yield ListView(id="files")
+                yield OptionList(id="files")
                 with Horizontal(id="keeperbar"):
                     yield Button("shortest", id="btn-keep-shortest")
                     yield Button("oldest", id="btn-keep-oldest")
@@ -1308,8 +1627,15 @@ class DedupeApp(App):
     async def on_mount(self) -> None:
         self.query_one("#bar", ProgressBar).styles.display = "none"
         self._update_keeper_buttons()
-        await self.perform_scan()
-        self.query_one("#groups", ListView).focus()
+        task = self.start_scan()
+        await asyncio.wait({task}, timeout=0.15)
+        self.query_one("#groups", OptionList).focus()
+
+    def on_unmount(self) -> None:
+        if self._scan_cancel is not None:
+            self._scan_cancel.set()
+        if self._scan_task is not None and not self._scan_task.done():
+            self._scan_task.cancel()
 
     def selected_path(self) -> Path | None:
         if self.current < 0:
@@ -1431,7 +1757,7 @@ class DedupeApp(App):
             return
         group.keeper = group.files[index]
         group.marked.discard(group.keeper)
-        asyncio.create_task(self.refresh_files())
+        self._refresh_file_rows(preserve_index=index)
 
     def action_cycle_keep(self) -> None:
         current = self.KEEP_STRATEGIES.index(self.keep) if self.keep in self.KEEP_STRATEGIES else -1
@@ -1443,13 +1769,15 @@ class DedupeApp(App):
         self.keep = strategy
         for group in self.groups:
             try:
-                group.keeper = choose_keeper(group.files, strategy)
+                group.keeper = choose_keeper(
+                    group.files, strategy, mtimes=group.mtimes or None
+                )
                 group.marked.discard(group.keeper)
             except OSError:
                 continue
         self._update_keeper_buttons()
         self.notify(f"Keeper strategy: {strategy}")
-        asyncio.create_task(self.refresh_files())
+        self._refresh_file_rows(preserve_index=self.file_index)
 
     def _update_keeper_buttons(self) -> None:
         for name in self.KEEP_STRATEGIES:
@@ -1461,6 +1789,9 @@ class DedupeApp(App):
 
     def action_focus_filter(self) -> None:
         self.query_one("#filter", Input).focus()
+
+    def _visible_groups(self) -> list[Group]:
+        return self.shown if self.shown is not None else self.groups
 
     def apply_filter(self, pattern: str) -> None:
         pattern = pattern.strip().lower()
@@ -1475,89 +1806,126 @@ class DedupeApp(App):
 
     def clear_filter(self) -> None:
         self.query_one("#filter", Input).value = ""
-        asyncio.create_task(self._render_groups(self.groups))
+        self.shown = None
+        asyncio.create_task(self._render_groups(self.groups, filtered=False))
 
-    async def _render_groups(self, groups: list[Group]) -> None:
-        self.shown = groups
-        view = self.query_one("#groups", ListView)
-        await view.clear()
-        await view.extend(GroupItem(group, self.root) for group in groups)
+    async def _render_groups(
+        self, groups: list[Group], *, filtered: bool = True
+    ) -> None:
+        self.shown = groups if filtered else None
+        view = self.query_one("#groups", OptionList)
+        view.clear_options()
+        view.add_options(_group_row(group, self.root) for group in groups)
         if groups:
-            view.index = 0
+            view.highlighted = 0
             await self.show_group(groups[0].index, focus=False)
         else:
             self.current = -1
+            self.file_index = None
             self.query_one("#detail-title", Static).update("  FILES IN GROUP")
-            await self.query_one("#files", ListView).clear()
+            self.query_one("#files", OptionList).clear_options()
             self._set_hint("  no matching groups")
 
     # -- scanning -------------------------------------------------------- #
 
     def _progress(self, state: ScanProgress) -> None:
-        self.call_from_thread(self._set_scan_state, state)
-
-    def _set_scan_state(self, state: ScanProgress) -> None:
         self.scan_state = state
 
-    async def perform_scan(self) -> None:
+    def start_scan(self) -> asyncio.Task[None]:
+        if self._scan_cancel is not None:
+            self._scan_cancel.set()
+        if self._scan_task is not None and not self._scan_task.done():
+            self._scan_task.cancel()
+        cancel = threading.Event()
+        self._scan_cancel = cancel
+        task = asyncio.create_task(self.perform_scan(cancel))
+        self._scan_task = task
+        return task
+
+    def _write_summary_stats(self) -> None:
+        wasted = sum(group.wasted for group in self.groups)
+        self._write_stats(
+            Text("  root ")
+            .append(self.root.name or str(self.root), style="bold cyan")
+            .append(f"   files {self.scanned}", style="white")
+            .append(f"   groups {len(self.groups)}", style="white")
+            .append(f"   reclaimable {human_bytes(wasted)}", style="bold red")
+        )
+
+    async def perform_scan(self, cancel: threading.Event | None = None) -> None:
+        if cancel is None:
+            if self._scan_cancel is not None:
+                self._scan_cancel.set()
+            cancel = threading.Event()
+            self._scan_cancel = cancel
+
         bar = self.query_one("#bar", ProgressBar)
         bar.styles.display = "block"
         self.scan_state = ScanProgress("walking")
         bar.total = None
         bar.progress = 0
         self.groups = []
+        self.shown = None
         self.current = -1
-        await self.query_one("#groups", ListView).clear()
-        await self.query_one("#files", ListView).clear()
+        self.file_index = None
+        self.query_one("#groups", OptionList).clear_options()
+        self.query_one("#files", OptionList).clear_options()
 
         job = asyncio.create_task(
             asyncio.to_thread(
-                scan, self.root, self.keep, self._progress, self.min_size
+                scan, self.root, self.keep, self._progress, self.min_size, cancel
             )
         )
         spinner = "-\\|/"
         step = 0
-        while not job.done():
-            state = self.scan_state
-            if state.total:
-                bar.total = state.total
-                bar.progress = state.files
-            else:
-                bar.total = None
-            text = Text("  scanning ")
-            text.append(f"[{spinner[step % 4]}] ", style="bold cyan")
-            text.append(f"{state.label} ", style="white")
-            if state.total:
-                text.append(f"{state.files}/{state.total} ", style="white")
-            else:
-                text.append(f"{state.files} files ", style="white")
-            if state.bytes_read:
-                text.append(f"· {human_bytes(state.bytes_read)} read ", style="dim")
-            text.append(short_path(self.root, self.root.parent), style="dim")
-            self._write_stats(text)
-            await asyncio.sleep(0.08)
-            step += 1
         try:
+            while not job.done():
+                if cancel.is_set():
+                    return
+                state = self.scan_state
+                if state.total:
+                    bar.total = state.total
+                    bar.progress = state.files
+                else:
+                    bar.total = None
+                text = Text("  scanning ")
+                text.append(f"[{spinner[step % 4]}] ", style="bold cyan")
+                text.append(f"{state.label} ", style="white")
+                if state.total:
+                    text.append(f"{state.files}/{state.total} ", style="white")
+                else:
+                    text.append(f"{state.files} files ", style="white")
+                if state.bytes_read:
+                    text.append(f"· {human_bytes(state.bytes_read)} read ", style="dim")
+                text.append(short_path(self.root, self.root.parent), style="dim")
+                self._write_stats(text)
+                await asyncio.sleep(0.08)
+                step += 1
             result = await job
+        except asyncio.CancelledError:
+            cancel.set()
+            return
         except Exception as error:  # noqa: BLE001 - surface scan failures in UI
-            self.notify(f"Scan failed: {error}", severity="error")
-            self._write_stats(Text("  scan failed"))
-            bar.styles.display = "none"
+            if not cancel.is_set():
+                self.notify(f"Scan failed: {error}", severity="error")
+                self._write_stats(Text("  scan failed"))
+                bar.styles.display = "none"
+            return
+
+        if cancel.is_set():
             return
 
         bar.styles.display = "none"
         self.root = result.root
         self.groups = result.groups
+        if self.sort_key == "name":
+            self.groups.sort(key=lambda g: str(g.files[0]))
+            for index, group in enumerate(self.groups):
+                group.index = index
         self.scanned = result.scanned
-        self._write_stats(
-            Text("  root ")
-            .append(result.root.name or str(result.root), style="bold cyan")
-            .append(f"   files {result.scanned}", style="white")
-            .append(f"   groups {len(result.groups)}", style="white")
-            .append(f"   reclaimable {human_bytes(result.wasted)}", style="bold red")
-        )
+        self._write_summary_stats()
         await self.rebuild_groups()
-        self.query_one("#groups", ListView).focus()
+        self.query_one("#groups", OptionList).focus()
 
     def _write_stats(self, text: Text) -> None:
         self.query_one("#stats", Static).update(text)
@@ -1565,13 +1933,46 @@ class DedupeApp(App):
     # -- list rendering -------------------------------------------------- #
 
     async def rebuild_groups(self) -> None:
-        view = self.query_one("#groups", ListView)
-        await view.clear()
-        await view.extend(GroupItem(group, self.root) for group in self.groups)
+        self.shown = None
+        view = self.query_one("#groups", OptionList)
+        view.clear_options()
+        view.add_options(_group_row(group, self.root) for group in self.groups)
         if self.groups:
-            view.index = 0
+            view.highlighted = 0
             self.current = 0
             await self.show_group(0, focus=False)
+        else:
+            self.current = -1
+            self.file_index = None
+            self.query_one("#detail-title", Static).update("  FILES IN GROUP")
+            self.query_one("#files", OptionList).clear_options()
+            self._set_hint("  no duplicate files found")
+
+    def _update_group_hint(self, group: Group) -> None:
+        self.query_one("#hint").remove_class("-hidden")
+        self.query_one("#hint", Static).update(
+            Text("  ").append(
+                f"{len(group.marked)} marked · space mark · d delete · buttons below: open / reveal / copy / info / preview",
+                style="dim",
+            )
+        )
+
+    def _refresh_file_rows(self, preserve_index: int | None = None) -> None:
+        if not 0 <= self.current < len(self.groups):
+            return
+        group = self.groups[self.current]
+        view = self.query_one("#files", OptionList)
+        if view.option_count == len(group.files):
+            for idx, path in enumerate(group.files):
+                view.replace_option_prompt_at_index(idx, _file_row(group, path, self.root))
+        else:
+            view.clear_options()
+            view.add_options(_file_row(group, path, self.root) for path in group.files)
+        if group.files:
+            idx = 0 if preserve_index is None else min(preserve_index, len(group.files) - 1)
+            self.file_index = idx
+            view.highlighted = idx
+        self._update_group_hint(group)
 
     async def show_group(self, index: int, focus: bool = False) -> None:
         if not 0 <= index < len(self.groups):
@@ -1586,58 +1987,57 @@ class DedupeApp(App):
             .append(f"   {len(group.files)} copies", style="white")
             .append(f"   {human_bytes(group.wasted)} wasted", style="bold red")
         )
-        view = self.query_one("#files", ListView)
-        await view.clear()
-        await view.extend(
-            FileItem(group, path, self.root)
-            for path in group.files
-        )
-        self.query_one("#hint").remove_class("-hidden")
-        self.query_one("#hint", Static).update(
-            Text("  ").append(
-                f"{len(group.marked)} marked · space mark · d delete · buttons below: open / reveal / copy / info / preview",
-                style="dim",
-            )
-        )
+        view = self.query_one("#files", OptionList)
+        view.clear_options()
+        view.add_options(_file_row(group, path, self.root) for path in group.files)
+        if group.files:
+            view.highlighted = 0
+        self._update_group_hint(group)
         if focus:
-            view.index = 0
+            view.highlighted = 0
             view.focus()
 
     async def refresh_files(self) -> None:
         if self.current >= 0:
-            await self.show_group(self.current)
+            self._refresh_file_rows(preserve_index=self.file_index)
 
     # -- events ---------------------------------------------------------- #
 
-    @on(ListView.Highlighted, "#groups")
-    async def highlight_group(self, event: ListView.Highlighted) -> None:
-        index = event.list_view.index
-        if index is not None and index != self.current:
-            await self.show_group(index)
+    @on(OptionList.OptionHighlighted, "#groups")
+    async def highlight_group(self, event: OptionList.OptionHighlighted) -> None:
+        visible = self._visible_groups()
+        pos = event.option_index
+        if 0 <= pos < len(visible):
+            target = visible[pos].index
+            if target != self.current:
+                await self.show_group(target)
 
-    @on(ListView.Selected, "#groups")
-    async def select_group(self, event: ListView.Selected) -> None:
-        await self.show_group(event.index, focus=True)
+    @on(OptionList.OptionSelected, "#groups")
+    async def select_group(self, event: OptionList.OptionSelected) -> None:
+        visible = self._visible_groups()
+        pos = event.option_index
+        if 0 <= pos < len(visible):
+            await self.show_group(visible[pos].index, focus=True)
 
-    @on(ListView.Selected, "#files")
-    async def select_file(self, event: ListView.Selected) -> None:
-        self.file_index = event.index
-        self.toggle_file(event.index)
+    @on(OptionList.OptionSelected, "#files")
+    async def select_file(self, event: OptionList.OptionSelected) -> None:
+        self.file_index = event.option_index
+        self.toggle_file(event.option_index)
 
-    @on(ListView.Highlighted, "#files")
-    def track_file(self, event: ListView.Highlighted) -> None:
-        self.file_index = event.list_view.index
+    @on(OptionList.OptionHighlighted, "#files")
+    def track_file(self, event: OptionList.OptionHighlighted) -> None:
+        self.file_index = event.option_index
 
     @on(Input.Submitted, "#filter")
     async def filter_submitted(self, event: Input.Submitted) -> None:
         self.apply_filter(event.value)
-        self.query_one("#groups", ListView).focus()
+        self.query_one("#groups", OptionList).focus()
 
     @on(Button.Pressed)
     def button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id or ""
         handlers = {
-            "btn-rescan": lambda: self.action_rescan(),
+            "btn-rescan": self.action_rescan,
             "btn-sort": self.action_sort,
             "btn-select-all": self.action_select_all,
             "btn-delete": self.action_delete,
@@ -1689,7 +2089,7 @@ class DedupeApp(App):
         def closed(_screen=None) -> None:
             screen = getattr(self, "_trash_screen", None)
             if screen is not None and getattr(screen, "restored", False):
-                asyncio.create_task(self.perform_scan())
+                self.start_scan()
 
         self._trash_screen = TrashScreen()
         self.push_screen(self._trash_screen, closed)
@@ -1708,21 +2108,26 @@ class DedupeApp(App):
             group.marked.discard(path)
         else:
             group.marked.add(path)
-        asyncio.create_task(self.refresh_files())
+        view = self.query_one("#files", OptionList)
+        if 0 <= index < view.option_count:
+            view.replace_option_prompt_at_index(index, _file_row(group, path, self.root))
+            self._update_group_hint(group)
+        else:
+            self._refresh_file_rows(preserve_index=index)
 
     def action_toggle(self) -> None:
-        if not self.groups:
+        if not self.groups or self.current < 0:
             return
-        files = self.query_one("#files", ListView)
+        files = self.query_one("#files", OptionList)
         if files.has_focus:
-            self.toggle_file(files.index or 0)
+            self.toggle_file(files.highlighted or 0)
             return
         group = self.groups[self.current]
         if group.marked:
             group.marked.clear()
         else:
             group.marked.update(path for path in group.files if path != group.keeper)
-        asyncio.create_task(self.refresh_files())
+        self._refresh_file_rows(preserve_index=self.file_index)
 
     def action_select_all(self) -> None:
         if not self.groups:
@@ -1733,7 +2138,7 @@ class DedupeApp(App):
             )
         count = sum(len(group.marked) for group in self.groups)
         self.notify(f"Marked all {count} duplicate(s)")
-        asyncio.create_task(self.refresh_files())
+        self._refresh_file_rows(preserve_index=self.file_index)
 
     def action_sort(self) -> None:
         key = "name" if self.sort_key == "waste" else "waste"
@@ -1745,7 +2150,11 @@ class DedupeApp(App):
             group.index = index
         self.notify(f"Sorted by {'name' if key == 'name' else 'wasted space'}")
         self.query_one("#btn-sort", Button).label = f"Sort: {key}"
-        asyncio.create_task(self.rebuild_groups())
+        pattern = self.query_one("#filter", Input).value.strip()
+        if pattern:
+            self.apply_filter(pattern)
+        else:
+            asyncio.create_task(self.rebuild_groups())
 
     def action_delete(self) -> None:
         paths = [
@@ -1757,7 +2166,12 @@ class DedupeApp(App):
         if not paths:
             self.notify("No files marked for deletion", severity="warning")
             return
-        wasted = sum(p.stat().st_size for p in paths if p.exists())
+        wasted = sum(
+            group.size
+            for group in self.groups
+            for path in group.marked
+            if path != group.keeper
+        )
 
         def confirmed(answer: bool) -> None:
             if answer:
@@ -1772,10 +2186,35 @@ class DedupeApp(App):
             self.notify(f"Trash failed: {error}", severity="error")
             return
         self.notify(f"Moved {len(paths)} files to trash")
-        await self.perform_scan()
+        removed = set(paths)
+        remaining: list[Group] = []
+        for group in self.groups:
+            kept_files = [path for path in group.files if path not in removed]
+            if len(kept_files) < 2:
+                continue
+            group.files = kept_files
+            group.marked.difference_update(removed)
+            for path in removed:
+                group.mtimes.pop(path, None)
+            if group.keeper not in kept_files:
+                group.keeper = choose_keeper(
+                    kept_files, self.keep, mtimes=group.mtimes or None
+                )
+                group.marked.discard(group.keeper)
+            remaining.append(group)
+        self.groups = remaining
+        for index, group in enumerate(self.groups):
+            group.index = index
+        self.scanned = max(0, self.scanned - len(paths))
+        self._write_summary_stats()
+        pattern = self.query_one("#filter", Input).value.strip()
+        if pattern:
+            self.apply_filter(pattern)
+        else:
+            await self.rebuild_groups()
 
     async def action_rescan(self) -> None:
-        await self.perform_scan()
+        self.start_scan()
 
     def action_tools(self) -> None:
         self.push_screen(ToolsScreen())
